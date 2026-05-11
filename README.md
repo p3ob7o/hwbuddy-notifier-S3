@@ -29,6 +29,8 @@ targets the older M5StickC Plus.
 - **Status reporting.** Battery, uptime, free heap, and approval stats are
   reported back via the `status` ack and shown in the Hardware Buddy panel.
 
+https://github.com/user-attachments/assets/a288a85c-3d04-4cc3-89a9-1e13994b7970
+
 ## Hardware
 
 - [M5Stack M5StickS3](https://shop.m5stack.com/products/m5sticks3-esp32s3-mini-iot-dev-kit)
@@ -53,10 +55,14 @@ auto-reset cleanly.
 ## Pairing
 
 1. **Claude Desktop** → **Help → Troubleshooting → Enable Developer Mode**.
+<img width="345" height="432" alt="Screenshot 2026-05-12 at 00 08 37" src="https://github.com/user-attachments/assets/66c9dd4b-9581-4e76-9a2e-fdf49c6e5e3b" />
+
 2. **Developer → Open Hardware Buddy…**
 3. Click **Connect**, pick `Claude-XXXX` from the list.
 4. The M5 shows a 6-digit passkey. macOS asks you to type it on the desktop.
 5. Done. The bond is persisted; reconnects are silent.
+
+https://github.com/user-attachments/assets/d5e79edf-de0d-4a65-99d1-d1dde6848541
 
 If you reflash with a different security setup, also Forget the device in
 macOS System Settings → Bluetooth so the stale LTK is cleared.
