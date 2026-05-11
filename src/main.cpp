@@ -12,6 +12,7 @@
 #include <Preferences.h>
 #include <AnimatedGIF.h>
 #include <esp_mac.h>
+#include <esp_system.h>
 #include <sys/time.h>
 
 #include "character_gif.h"
@@ -58,6 +59,15 @@ static volatile bool bleBonded = false;
 static volatile uint32_t pendingPasskey = 0;  // 6-digit code being shown
 static uint16_t bleMtu = 23;
 static String rxBuffer;
+
+// Edge flags set by BLE callbacks and drained by the main loop. We do
+// this because lgfx (display) and other M5 peripherals are NOT thread-
+// safe, and touching them from the NimBLE host task can crash the chip
+// (we saw repeated reset_reason=4 panics until the battery died). The
+// callbacks are now strictly state-setters; the main loop owns all I/O.
+static volatile bool bleConnectEdge = false;
+static volatile bool bleDisconnectEdge = false;
+static volatile bool bleAuthEdge = false;
 
 // ---- Persistent ----
 static Preferences prefs;
@@ -303,6 +313,55 @@ static void drawPasskeyScreen(uint32_t pin) {
   d.endWrite();
 }
 
+// Centered battery icon + percentage. Anchor (cx, cy) is the center of
+// the icon; the percentage text sits below.
+static void drawBatteryWidget(int cx, int cy) {
+  auto& d = M5.Display;
+  int lvl = M5.Power.getBatteryLevel();
+  bool charging = M5.Power.isCharging();
+
+  const int bw = 70, bh = 32;
+  const int nubW = 4, nubH = bh / 2;
+  int bx = cx - (bw + nubW) / 2;
+  int by = cy - bh / 2;
+
+  // Outline (2 px stroke) and nub on the right
+  d.drawRect(bx, by, bw, bh, TFT_LIGHTGREY);
+  d.drawRect(bx + 1, by + 1, bw - 2, bh - 2, TFT_LIGHTGREY);
+  d.fillRect(bx + bw, by + (bh - nubH) / 2, nubW, nubH, TFT_LIGHTGREY);
+
+  // Fill color reflects level (or charging state)
+  uint16_t color;
+  if (charging)        color = TFT_GREENYELLOW;
+  else if (lvl >= 30)  color = TFT_GREEN;
+  else if (lvl >= 15)  color = TFT_ORANGE;
+  else                 color = TFT_RED;
+
+  if (lvl > 0) {
+    int innerX = bx + 3, innerY = by + 3;
+    int innerW = bw - 6, innerH = bh - 6;
+    int fillW = innerW * lvl / 100;
+    if (fillW > 0) d.fillRect(innerX, innerY, fillW, innerH, color);
+  }
+
+  // Percentage in a bigger font, centered below the icon
+  char buf[8];
+  if (lvl >= 0) snprintf(buf, sizeof(buf), "%d%%", lvl);
+  else          strcpy(buf, "--");
+  d.setFont(&fonts::Font4);
+  d.setTextDatum(top_center);
+  d.setTextColor(TFT_WHITE, TFT_BLACK);
+  d.drawString(buf, cx, by + bh + 6);
+
+  if (charging) {
+    d.setFont(&fonts::Font0);
+    d.setTextColor(TFT_GREENYELLOW, TFT_BLACK);
+    d.drawString("charging", cx, by + bh + 6 + 26);
+  }
+  d.setFont(&fonts::Font0);
+  d.setTextDatum(top_left);
+}
+
 static void drawIdleDisconnected() {
   auto& d = M5.Display;
   d.startWrite();
@@ -320,6 +379,7 @@ static void drawIdleDisconnected() {
   d.drawString("Open Hardware Buddy", 4, 50);
   d.drawString("in Claude Desktop", 4, 62);
   d.drawString("(Developer menu)", 4, 74);
+  drawBatteryWidget(d.width() / 2, 150);
   d.endWrite();
 }
 
@@ -356,8 +416,12 @@ static void drawIdleGlance() {
     d.setTextColor(TFT_DARKGREY);
     d.drawString("Idle", 4, y);
   }
+  // Battery widget in the empty middle area.
+  drawBatteryWidget(d.width() / 2, 150);
   // Stats footer
-  d.setTextColor(TFT_DARKGREY);
+  d.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  d.setFont(&fonts::Font0);
+  d.setTextDatum(top_left);
   char st[32];
   snprintf(st, sizeof(st), "appr %lu  deny %lu",
            (unsigned long)statApprove, (unsigned long)statDeny);
@@ -554,6 +618,7 @@ static void handleLine(const String& line) {
     prefs.putString("owner", ownerName);
     sendAck("owner");
   } else if (strcmp(cmd, "unpair") == 0) {
+    Serial.println("[ble] unpair requested by desktop");
     NimBLEDevice::deleteAllBonds();
     sendAck("unpair");
   } else if (strcmp(cmd, "char_begin") == 0 || strcmp(cmd, "char_end") == 0
@@ -582,39 +647,35 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 class ServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
+  void onConnect(NimBLEServer*, NimBLEConnInfo& info) override {
     bleConnected = true;
     bleMtu = 23;
-    // From idle-disconnected we drop to sleep; the user shouldn't need to
-    // see "connected" once we've paired once. If pairing is needed,
-    // onPassKeyDisplay() will wake us back up momentarily.
-    if (mode == UIMode::IdleDisconnected) {
-      enterMode(UIMode::IdleSleeping);
-      screenSleep();
-    }
+    Serial.printf("[ble] connect enc=%d bonded=%d numBonds=%d\n",
+                  info.isEncrypted(), info.isBonded(),
+                  NimBLEDevice::getNumBonds());
+    bleConnectEdge = true;
   }
-  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
+  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
+    Serial.printf("[ble] disconnect reason=0x%02x numBonds=%d\n",
+                  reason, NimBLEDevice::getNumBonds());
     bleConnected = false;
     bleBonded = false;
     hb.fresh = false;
     hb.promptActive = false;
-    enterMode(UIMode::IdleDisconnected);
-    screenWake();
-    drawIdleDisconnected();
-    NimBLEDevice::startAdvertising();
+    bleDisconnectEdge = true;
   }
   void onMTUChange(uint16_t MTU, NimBLEConnInfo&) override { bleMtu = MTU; }
 
   // Called when the peer initiates pairing and we have IO=DisplayOnly.
-  // We generate a 6-digit passkey, show it, and return it — the peer
-  // (Claude Desktop) will prompt the user to type the same code.
+  // We generate a 6-digit passkey and return it — the peer (Claude
+  // Desktop) will prompt the user to type the same code. The screen
+  // render is deferred to the main loop because the NimBLE host thread
+  // expects callbacks to return quickly; doing ~50 ms of SPI traffic
+  // here can trip the watchdog and trigger a reboot loop.
   uint32_t onPassKeyDisplay() override {
     uint32_t pin = (esp_random() % 900000u) + 100000u;
     pendingPasskey = pin;
-    screenWake();
-    drawPasskeyScreen(pin);
-    enterMode(UIMode::Pairing);
-    Serial.printf("[ble] pairing passkey: %06u\n", (unsigned)pin);
+    Serial.printf("[ble] passkey requested: %06u\n", (unsigned)pin);
     return pin;
   }
 
@@ -622,17 +683,21 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     bool ok = info.isEncrypted();
     bleBonded = ok && info.isBonded();
     pendingPasskey = 0;
-    Serial.printf("[ble] auth complete: enc=%d bonded=%d\n",
-                  info.isEncrypted(), info.isBonded());
-    if (mode == UIMode::Pairing) {
-      enterMode(UIMode::IdleSleeping);
-      screenSleep();
-    }
+    Serial.printf("[ble] auth complete: enc=%d bonded=%d numBonds=%d\n",
+                  info.isEncrypted(), info.isBonded(),
+                  NimBLEDevice::getNumBonds());
+    bleAuthEdge = true;
   }
 };
 
-  d.drawString("bd ol be bg r2 c2", xStart + 12, yE + cellH + 6);
-}
+// ---- Color diagnostic ----
+// Draws known colors four ways and holds for ~20 seconds so the screen
+// can be photographed and compared against ground truth.
+//  Row A: TFT_* constants (lgfx's named colors via fillRect)
+//  Row B: M5.Display.color888(r, g, b)             (via fillRect)
+//  Row C: hand-packed RGB565                        (via pushImage)
+//  Row D: lgfx::swap565 + pushImage                 (the GIF code path)
+// Columns within each row: red, green, blue, white, gray, beige
 
 // ---- Setup / loop ----
 void setup() {
@@ -657,11 +722,14 @@ void setup() {
 
   Serial.begin(115200);
   delay(50);
-  Serial.printf("[boot] %s ready (heap=%u)\n", deviceName.c_str(), ESP.getFreeHeap());
+  Serial.printf("[boot] %s ready (heap=%u) reset_reason=%d\n",
+                deviceName.c_str(), ESP.getFreeHeap(),
+                (int)esp_reset_reason());
 
   NimBLEDevice::init(deviceName.c_str());
   NimBLEDevice::setMTU(247);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  Serial.printf("[boot] stored bonds: %d\n", NimBLEDevice::getNumBonds());
   // LE Secure Connections with bonding + MITM protection, DisplayOnly IO.
   // Pairs via "Passkey Entry: Peripheral Displays" — we generate a
   // 6-digit code, show it, the desktop user types it in. After bonding
@@ -682,9 +750,14 @@ void setup() {
       NIMBLE_PROPERTY::NOTIFY
         | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN);
 
+  // Put the device name in the primary advertising packet and the
+  // 128-bit NUS UUID in the scan response — both don't fit in a single
+  // 31-byte adv frame ("Cannot add UUID, data length exceeded").
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->setName(deviceName.c_str());
-  adv->addServiceUUID(NUS_SERVICE);
+  NimBLEAdvertisementData scanResp;
+  scanResp.addServiceUUID(NUS_SERVICE);
+  adv->setScanResponseData(scanResp);
   adv->enableScanResponse(true);
   NimBLEDevice::startAdvertising();
 
@@ -702,6 +775,49 @@ void loop() {
   // IMU sampling runs unconditionally so we always know orientation and
   // can pick up shakes mid-prompt.
   tickIMU();
+
+  // Drain BLE callback edges. Callbacks set flags; we do the display
+  // / advertising / mode work here, on the main thread.
+  if (bleConnectEdge) {
+    bleConnectEdge = false;
+    if (mode == UIMode::IdleDisconnected) {
+      enterMode(UIMode::IdleSleeping);
+      screenSleep();
+    }
+  }
+  if (bleDisconnectEdge) {
+    bleDisconnectEdge = false;
+    stopMelody();
+    stopGifPlayback();
+    enterMode(UIMode::IdleDisconnected);
+    screenWake();
+    drawIdleDisconnected();
+    NimBLEDevice::startAdvertising();
+  }
+  if (bleAuthEdge) {
+    bleAuthEdge = false;
+    // If we were showing the passkey screen, drop back to sleep.
+    if (mode == UIMode::Pairing) {
+      enterMode(UIMode::IdleSleeping);
+      screenSleep();
+    }
+  }
+
+  // Pick up a deferred passkey from the BLE callback and render it
+  // from the main loop (BLE callbacks aren't safe places to do heavy
+  // display I/O).
+  static uint32_t lastDrawnPasskey = 0;
+  uint32_t pk = pendingPasskey;
+  if (pk != 0 && pk != lastDrawnPasskey) {
+    lastDrawnPasskey = pk;
+    stopMelody();
+    stopGifPlayback();
+    screenWake();
+    drawPasskeyScreen(pk);
+    enterMode(UIMode::Pairing);
+  } else if (pk == 0 && lastDrawnPasskey != 0) {
+    lastDrawnPasskey = 0;
+  }
 
   // Melody (alert chime) — runs independently of the UI state machine
   // so it can keep playing while the GIF animates.
