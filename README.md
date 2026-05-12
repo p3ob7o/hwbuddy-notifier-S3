@@ -90,6 +90,20 @@ the embedded GIF decoder). Best results from a transparent-background GIF.
 `src/melody.h` is a flat list of `{frequency_Hz, duration_ms}` entries. Rests
 are `frequency = 0`. Edit by hand. The shipped default is a three-note arpeggio.
 
+## Using with standalone Claude Code CLI
+
+Out of the box, the BLE bridge lives inside Claude Desktop — so this firmware
+sees prompts from sessions hosted by Claude Desktop, but not from a plain
+`claude` CLI running in a regular terminal.
+
+If you want the latter, [**cc-buddy-bridge**](https://github.com/SnowWarri0r/cc-buddy-bridge)
+is a community Python daemon that replaces Claude Desktop on the BLE side. It
+runs as a launchd / systemd / Task Scheduler service, hooks into Claude Code's
+`PreToolUse` to block tool calls until you press A/B on the stick, and speaks
+the same wire protocol this firmware implements. Note: the stick can only be
+talked to by one central at a time, so quit Claude Desktop (or unpair from its
+Hardware Buddy panel) before starting the bridge.
+
 ## Protocol
 
 The wire format is fully documented at
